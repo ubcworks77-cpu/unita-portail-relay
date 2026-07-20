@@ -28,7 +28,55 @@ const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 const VAPID_CONTACT_EMAIL = process.env.VAPID_CONTACT_EMAIL || "mailto:info@ezw.works";
 // Secret partagé simple pour vérifier que les appels /webhook/odoo viennent bien d'Odoo
+// (transmis en query string ?secret=... car l'action native "Envoyer une notification
+// webhook" d'Odoo ne permet pas d'ajouter des clés personnalisées dans le corps JSON).
 const ODOO_WEBHOOK_SECRET = process.env.ODOO_WEBHOOK_SECRET || "changeme";
+
+// --- Accès API Odoo (pour résoudre partner_id -> email, l'automatisation
+// Odoo ne peut envoyer que l'ID brut, pas l'email directement) ---
+const ODOO_URL = process.env.ODOO_URL || "https://ub-center.odoo.com";
+const ODOO_DB = process.env.ODOO_DB || "ub-center";
+const ODOO_LOGIN = process.env.ODOO_LOGIN;
+const ODOO_API_KEY = process.env.ODOO_API_KEY;
+
+let odooUidCache = null;
+
+async function odooJsonRpc(service, method, args) {
+  const res = await fetch(`${ODOO_URL}/jsonrpc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "call",
+      params: { service, method, args },
+      id: Date.now(),
+    }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(JSON.stringify(data.error));
+  return data.result;
+}
+
+async function odooAuthenticate() {
+  if (odooUidCache) return odooUidCache;
+  if (!ODOO_LOGIN || !ODOO_API_KEY) {
+    throw new Error("ODOO_LOGIN / ODOO_API_KEY non configurés");
+  }
+  odooUidCache = await odooJsonRpc("common", "authenticate", [ODOO_DB, ODOO_LOGIN, ODOO_API_KEY, {}]);
+  if (!odooUidCache) throw new Error("Authentification Odoo échouée");
+  return odooUidCache;
+}
+
+// Résout l'email d'un partenaire (res.partner) à partir de son ID.
+async function getPartnerEmail(partnerId) {
+  if (!partnerId) return null;
+  const uid = await odooAuthenticate();
+  const result = await odooJsonRpc("object", "execute_kw", [
+    ODOO_DB, uid, ODOO_API_KEY,
+    "res.partner", "read", [[partnerId], ["email"]],
+  ]);
+  return result && result[0] ? result[0].email : null;
+}
 
 if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
   console.warn(
@@ -85,32 +133,66 @@ app.post("/subscribe", (req, res) => {
   res.json({ ok: true });
 });
 
+// Construit le message push selon le modèle Odoo à l'origine du webhook.
+function buildNotification(modelName) {
+  if (modelName === "account.move") {
+    return {
+      title: "Nouvelle facture disponible",
+      body: "Une facture vient d'être émise sur votre compte Unita.",
+      url: "https://ub-center.odoo.com/my/invoices",
+    };
+  }
+  if (modelName === "documents.document") {
+    return {
+      title: "Nouveau courrier reçu",
+      body: "Un document vient d'être ajouté à votre espace courrier.",
+      url: "https://ub-center.odoo.com/my/documents",
+    };
+  }
+  return {
+    title: "Unita Business Zaventem",
+    body: "Nouvelle information disponible sur votre portail.",
+    url: "https://ub-center.odoo.com/my/home",
+  };
+}
+
 // ---------------------------------------------------------------------
-// POST /webhook/odoo — appelé par l'action "Envoyer une notification
-// webhook" d'une règle d'automatisation Odoo.
+// POST /webhook/odoo?secret=... — appelé par l'action native "Envoyer une
+// notification webhook" d'une règle d'automatisation Odoo.
 //
-// Payload attendu (configuré dans Odoo, champ "Champs" de l'action) :
-// {
-//   "secret": "...",
-//   "type": "courrier" | "facture",
-//   "partner_email": "client@example.com",
-//   "title": "Nouveau courrier reçu",
-//   "body": "Un document vient d'être ajouté à votre espace.",
-//   "url": "https://ub-center.odoo.com/my/documents"
-// }
+// Le secret est passé en query string (?secret=...) car l'action native
+// d'Odoo ne permet pas d'ajouter des clés personnalisées dans le corps JSON :
+// elle n'envoie que les valeurs brutes des champs sélectionnés ("Champs"),
+// plus les métadonnées _action / _id / _model. Il faut donc que la règle
+// Odoo inclue le champ "Partenaire" (partner_id) — le relais résout
+// lui-même son email via l'API Odoo.
+//
+// Corps reçu, ex. :
+// { "_action": "...", "_id": 887, "_model": "account.move", "partner_id": 45 }
 // ---------------------------------------------------------------------
 app.post("/webhook/odoo", async (req, res) => {
-  const { secret, partner_email, title, body, url } = req.body || {};
-
-  if (secret !== ODOO_WEBHOOK_SECRET) {
+  if (req.query.secret !== ODOO_WEBHOOK_SECRET) {
     return res.status(401).json({ error: "secret invalide" });
   }
-  if (!partner_email) {
-    return res.status(400).json({ error: "partner_email requis" });
+
+  const { _model, partner_id } = req.body || {};
+  if (!partner_id) {
+    return res.status(400).json({ error: "partner_id requis" });
+  }
+
+  let partnerEmail;
+  try {
+    partnerEmail = await getPartnerEmail(partner_id);
+  } catch (err) {
+    console.error("Erreur résolution email Odoo:", err.message);
+    return res.status(502).json({ error: "résolution email Odoo échouée" });
+  }
+  if (!partnerEmail) {
+    return res.json({ ok: true, sent: 0, reason: "email introuvable" });
   }
 
   const db = loadDb();
-  const k = keyFor(partner_email);
+  const k = keyFor(partnerEmail);
   const subs = db.subscriptions[k] || [];
 
   if (subs.length === 0) {
@@ -119,11 +201,7 @@ app.post("/webhook/odoo", async (req, res) => {
     return res.json({ ok: true, sent: 0 });
   }
 
-  const payload = JSON.stringify({
-    title: title || "Unita Business Zaventem",
-    body: body || "Nouvelle information disponible sur votre portail.",
-    url: url || "https://ub-center.odoo.com/my/home",
-  });
+  const payload = JSON.stringify(buildNotification(_model));
 
   let sent = 0;
   const stillValid = [];
